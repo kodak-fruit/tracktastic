@@ -1,0 +1,6 @@
+.venv
+.mypy_cache
+.vscode
+output
+log.txt
+config.toml

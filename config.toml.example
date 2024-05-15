@@ -1,0 +1,64 @@
+# Sync the device through Finder before and after the script runs.
+[sync]
+enabled = false
+# iphone_name = "Dylan’s iPhone 15"
+
+[playlists.input]
+# The source playlist to use for track ratings and favorites.
+source_playlist = "candidates"
+
+# Only the subset of tracks also in this playlist will be used when generating output playlists.
+# subset_playlist = "synced"     # used for output playlists
+
+# Save statistics for every track in the source/subset playlists to JSON files in output/.
+# If present, these will be loaded on subsequent runs to improve the calculated scores.
+save_stats = false
+
+# Clears the album rating for all albums in the ENTIRE LIBRARY.
+# This is helpful because iTunes seems to set these randomly sometimes,
+# and they will get inherited by the track ratings.
+[album_ratings]
+clear = false
+
+# Updates the rating for all tracks in the source playlist based on a calculated score.
+[track_ratings]
+update = true
+
+# Updates the favorite status of all tracks in the source playlist.
+[favorites]
+update = false
+
+# If a song is has a calculated socre within the (top_percent) of the playlist,
+# then it is marked as a favorite.
+# Otherwise, any existing favorite status (included disliked) is removed.
+# top_percent = 15
+
+# Updates generated output playlists based on the source (or subset) playlist.
+[playlists.output]
+
+# If force_update is set, the playlists will be cleared and regenerated from scratch.
+force_update = false
+
+# If force_update is unset and update_every is set,
+# then playlists will only be updated if the last update was more than the specified duration ago.
+# update_every = { hours = 12 }
+
+# If update is unset and remove_only is set,
+# the songs not in the source will be removed, but it won't otherwise be updated.
+remove_only = false
+
+# A generated playlist with the tracks shuffled, weighted by a calculated score.
+[playlists.output.shuffle]
+enabled = false
+# name = "weighted shuffle"
+
+# Downranked fields will be ranked lower in the playlist, but not completely excluded.
+# downranked_genres = ["chill lofi", "video game music"]
+# downranked_artists = ["matt pond pa", "shakey graves"]
+
+# Save statistics for albums/artists/genres/etc. in the source playlist to JSON files in output/.
+[collections]
+save_stats = false
+
+# Only stats for playlists in this folder will be calculated.
+# playlist_folder = "SYNC 2.0"

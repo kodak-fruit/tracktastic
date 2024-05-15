@@ -1,0 +1,15 @@
+# deps
+appscript
+colorlog
+click
+matplotlib
+psutil
+tomli
+tqdm
+
+# linters
+isort
+flake8
+black
+pylint
+mypy
