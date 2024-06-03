@@ -39,7 +39,14 @@ This repository contains scripts to manage and update track ratings and playlist
 
 ### Update Track Ratings and Playlists
 
-To dry-run the script and generate statistics for your library, run:
+To dry-run the script and generate the statistics for your library, run:
+```sh
+make dry-run
+```
+
+### Active Mode
+
+To run the update script and actually update iTunes, use:
 ```sh
 make update
 ```
@@ -51,45 +58,104 @@ To sync your iPhone with iTunes/Music app, run:
 make sync
 ```
 
-### Active Mode
+### Other
 
-To run the update script in active mode (actually apply changes), use:
-```sh
-make update-active
+The `plot` and `insights` make targets expose additional python scripts, but these currently rely on hard-coded playlist names and may not work with other setups.
+
+<!-- ## Configuration Options -->
+
+
+## Score Calculation for Music Tracks
+
+This section explains the calculation process for determining the score of a music track based on various metrics such as play count, skip count, and time-based factors.
+
+### Key Metrics
+
+1. **Play Rate**: The average number of plays per unit time since the track was added.
+   ```
+   play_rate = play_count / duration_since_added
+   ```
+
+2. **Skip Rate**: The average number of skips per unit time since the track was added.
+   ```
+   skip_rate = skip_count / duration_since_added
+   ```
+
+3. **Listen Rate**: The total time spent listening to the track per unit time since it was added, normalized by the median song length.
+   ```
+   time_spent_listening = play_count * track_duration
+   listen_rate = time_spent_listening / duration_since_added
+   norm_listen_rate = listen_rate / median_song_length
+   ```
+
+4. **Net Rate**: A composite metric that combines play rate, normalized listen rate, and skip rate.
+   ```
+   net_rate = (play_rate + norm_listen_rate - skip_rate) / 2
+   ```
+
+## Time Between Plays and Overdue Duration
+
+5. **Time Between Plays**: A representative value for the average duration between plays based on the net rate.
+   ```
+   time_between_plays = 1 / net_rate
+   ```
+
+6. **Overdue Duration**: The difference between the duration since the last interaction (either play or skip) and the expected duration between plays.
+   ```
+   overdue_duration = duration_since_last_interaction - time_between_plays
+   ```
+
+7. **Overdue Factor**: The normalized ratio of the overdue duration to the expected duration between plays.
+   ```
+   overdue = overdue_duration / time_between_plays
+   ```
+
+#### Explanation of Overdue Factor
+
+The overdue factor measures how overdue a track is for being played again. A higher overdue factor indicates that a track has not been played for a longer time than expected based on its play rate. This metric helps in identifying tracks that might need attention or re-evaluation, especially in creating playlists or deciding which tracks to promote or demote.
+
+### Score Calculation
+
+The final score is a logarithmic function of the net rate.
+```
+score = log_n(1 + net_rate)
 ```
 
-## Configuration Options
+Where:
+- `n` is a predefined constant used to adjust the scaling of the score.
 
-### `config.toml`
+The score provides a quantitative measure of the track's popularity and engagement, taking into account how often it is played versus skipped, and adjusting for the time since it was added to the library.
 
-- **Sync Settings:**
-  - `enabled`: Enable or disable syncing.
-  - `iphone_name`: Name of your iPhone as it appears in Finder.
+## Weighted Shuffle Algorithm
 
-- **Playlists Input:**
-  - `source_playlist`: The source playlist to use for track ratings and favorites.
-  - `subset_playlist`: Only the subset of tracks also in this playlist will be used when generating output playlists.
-  - `save_stats`: Save statistics for every track in the source/subset playlists to JSON files in `output/`.
+This section describes the weighted shuffle algorithm used for ordering a list of music tracks based on their individual scores and other influencing factors. The algorithm ensures that tracks with higher scores or positive attributes have a higher probability of appearing earlier in the shuffled list.
 
-- **Album Ratings:**
-  - `clear`: Clears the album rating for all albums in the entire library.
+### Algorithm Description
 
-- **Track Ratings:**
-  - `update`: Updates the rating for all tracks in the source playlist based on a calculated score.
+1. **Initialize Random Seed**:
+   - A random seed is set based on the current day to ensure that the shuffle result remains consistent throughout the day.
 
-- **Favorites:**
-  - `update`: Updates the favorite status of all tracks in the source playlist.
-  - `top_percent`: If a song has a calculated score within the top percent of the playlist, it is marked as a favorite.
+2. **Prepare Weights**:
+   - For each track, an initial weight is calculated based on the track's score. If a track has a score of zero, a predefined target median score is used instead.
+   - The weight is then adjusted:
+     - If the track is downranked, the weight is halved.
+     - If the track is marked as a favorite, the weight is doubled.
+   - Further adjustments are made based on the track's overdue factor, which measures how overdue the track is for being played. The weight is multiplied by `(1 + overdue factor)`.
 
-- **Playlists Output:**
-  - `force_update`: The playlists will be cleared and regenerated from scratch.
-  - `update_every`: Playlists will only be updated if the last update was more than the specified duration ago.
-  - `remove_only`: The songs not in the source will be removed, but it won't otherwise be updated.
-  - `shuffle`: A generated playlist with the tracks shuffled, weighted by a calculated score.
+3. **Normalize Weights**:
+   - To avoid negative or zero weights, the smallest weight is identified, and a small floor value (e.g., 0.01) is added to each weight after subtracting the minimum weight from each.
 
-- **Collections:**
-  - `save_stats`: Save statistics for albums/artists/genres/etc. in the source playlist to JSON files in `output/`.
-  - `playlist_folder`: Only stats for playlists in this folder will be calculated.
+4. **Shuffle Process**:
+   - The total weight of all tracks is calculated.
+   - A loop runs until all tracks have been shuffled:
+     - A random value between 0 and the total weight is generated.
+     - The algorithm iterates through the tracks and subtracts their respective weights from the random value until it reaches zero or below. The corresponding track is selected and removed from the list.
+     - The weight of the selected track is subtracted from the total weight.
+   - This process is repeated until all tracks have been selected and added to the shuffled list.
+
+### Summary
+
+The weighted shuffle algorithm provides a method for ordering tracks based on a combination of their scores, downranking, favorite status, and overdue factors. By adjusting the weights accordingly, the algorithm ensures a fair and dynamic shuffle that reflects the varying attributes of each track.
 
 ## License
 

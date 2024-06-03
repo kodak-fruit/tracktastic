@@ -15,8 +15,9 @@ from collections import defaultdict
 from dataclasses import InitVar, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from typing import Any, Callable, ClassVar, List, Optional, Set
+from typing import Any, Callable, ClassVar, Dict, List, Optional, Set
 
+import numpy as np
 import psutil
 import tomli
 import tqdm
@@ -26,18 +27,20 @@ from colorlog import ColoredFormatter
 SCRIPT_DIR = Path(__file__).resolve().parent
 OUTPUT_DIR = SCRIPT_DIR / "output"
 CONFIG_PATH = SCRIPT_DIR / "config.toml"
+LOG_PATH = OUTPUT_DIR / "log.txt"
+
+# TODO: just use a sql database for stats w/ history, instead of json file snapshots
 
 NOW = dt.datetime.now()
 ONE_YEAR = dt.timedelta(days=365.25)
+ONE_MONTH = dt.timedelta(days=30)
 ONE_DAY = dt.timedelta(days=1)
 ONE_HOUR = dt.timedelta(hours=1)
 ONE_MIN = dt.timedelta(minutes=1)
 
-MEDIAN_SONG_LENGTH = dt.timedelta(minutes=3, seconds=45)
-DEFAULT_SCORE_BASE = 3.0
-TARGET_MEDIAN_SCORE = 1.0
-
-LOG_PATH = SCRIPT_DIR / "log.txt"
+MEDIAN_SONG_LENGTH = dt.timedelta(minutes=3, seconds=48.208496)
+DEFAULT_SCORE_BASE = 1.587
+TARGET_MEDIAN_SCORE = (5.0 + 0.05) / 2
 
 PROGRESS_INTERVAL = 2.5
 
@@ -52,80 +55,251 @@ class FavoriteStatus(Enum):
 
 @dataclass
 class Track:
-    api: InitVar[Any]
+    api: Optional[Any]
 
-    _api: Any = field(init=False)
+    name: str
+    track_artist: str
+    album: str
+    album_artist: str
+    genre: str
+    year: int
+    track_number: int
+    play_count: int
+    skip_count: int
+    duration: dt.timedelta
+    date_added: dt.datetime
+    rating: int
+    dbid: int
+    compilation: bool
+    size: int
+    favorite: bool
+    last_played: dt.datetime
+    last_skipped: dt.datetime
 
-    name: str = field(init=False)
-    track_artist: str = field(init=False)
-    album: str = field(init=False)
-    album_artist: str = field(init=False)
-    genre: str = field(init=False)
-    year: int = field(init=False)
-    track_number: int = field(init=False)
-    play_count: int = field(init=False)
-    skip_count: int = field(init=False)
-    duration: dt.timedelta = field(init=False)
-    date_added: dt.datetime = field(init=False)
-    rating: int = field(init=False)
-    dbid: int = field(init=False)
-    shuffleable: bool = field(init=False)
+    duration_since_last_played: dt.timedelta
+    duration_since_last_skipped: dt.timedelta
+    duration_since_added: dt.timedelta
+    duration_since_last_interaction: dt.timedelta
+    play_rate: float
+    skip_rate: float
+    listen_rate: dt.timedelta
+    net_rate: float
+    score: float
+    time_between_plays: dt.timedelta
+    overdue_duration: dt.timedelta
+    overdue: float
 
-    duration_since_added: dt.timedelta = field(init=False)
-    play_rate: float = field(init=False)
-    listen_rate: dt.timedelta = field(init=False)
-    score: float = field(init=False)
-
-    playlists: List[str] = field(default_factory=list)
+    playlists: List[str]
 
     # class variables
     median_song_length: ClassVar[dt.timedelta] = MEDIAN_SONG_LENGTH
     score_base: ClassVar[float] = DEFAULT_SCORE_BASE
     downranked_artists: ClassVar[Set[str]] = set()
     downranked_genres: ClassVar[Set[str]] = set()
-
-    def __post_init__(self, api):
-        self._api = api
-        self.name = api.name() or "Unknown Track"
-        self.track_artist = api.artist() or "Unknown Track Artist"
-        self.album = api.album() or "Unknown Album"
-        self.album_artist = api.album_artist() or "Unknown Album Artist"
-        self.genre = api.genre() or "Unknown Genre"
-        self.year = api.year()
-        self.track_number = api.track_number()
-        self.play_count = api.played_count()
-        self.skip_count = api.skipped_count()
-        self.duration = dt.timedelta(seconds=api.duration())
-        self.date_added = api.date_added()
-        self.rating = api.rating()
-        self.dbid = api.database_ID()
-        self.shuffleable = api.shufflable()
-        if not self.shuffleable:
-            logger.warning(f"{self.display()} is not shuffleable")
-
-        net_play_count = self.play_count - self.skip_count
-        time_spent_listening = self.play_count * self.duration
-        self.duration_since_added = NOW - self.date_added
-
-        years_since_added = self.duration_since_added / ONE_YEAR
-        self.play_rate = net_play_count / years_since_added
-        self.listen_rate = time_spent_listening / years_since_added
-        norm_listen_rate = self.listen_rate / self.median_song_length
-        rate_avg = (self.play_rate + norm_listen_rate) / 2
-        self.score = math.log(1 + rate_avg, self.score_base)
+    loaded_playlists: ClassVar[Set[Any]] = set()
 
     @classmethod
-    def set_down_ranked_arists(cls, downranked_artists: List[str]) -> None:
-        cls.downranked_artists = {x.casefold() for x in downranked_artists}
+    def set_down_ranked(cls, *, artists: List[str], genres: List[str]) -> None:
+        cls.downranked_artists = {x.casefold() for x in artists}
+        cls.downranked_genres = {x.casefold() for x in genres}
 
-    @classmethod
-    def set_down_ranked_genres(cls, downranked_genres: List[str]) -> None:
-        cls.downranked_genres = {x.casefold() for x in downranked_genres}
+    def similarity_to(self, other: Track) -> float:
+        """Returns a similarity score between 0 and 1"""
+        sim_vec: List[float] = []
+        # album
+        sim_vec.append(self.album == other.album)
+        # album artist
+        sim_vec.append(self.album_artist == other.album_artist)
+        # genre
+        sim_vec.append(self.genre == other.genre)
+        # closeness of year
+        year_cutoff = 5
+        year_diff = abs(self.year - other.year)
+        year_sim = 1 - year_diff / year_cutoff if year_diff <= year_cutoff else 0
+        sim_vec.append(year_sim)
+        # added within 6 months of each other
+        added_cutoff = 6 * ONE_MONTH
+        added_diff = abs(self.date_added - other.date_added)
+        added_sim = 1 - added_diff / added_cutoff if added_diff <= added_cutoff else 0
+        sim_vec.append(added_sim)
+        # last played on the same day
+        sim_vec.append(self.last_played.date() == other.last_played.date())
+        # overlapping playlists
+        combined_playlists = set(self.playlists) | set(other.playlists)
+        common_playlists = set(self.playlists) & set(other.playlists)
+        playlist_sim = (
+            len(common_playlists) / len(combined_playlists) if combined_playlists else 0
+        )
+        sim_vec.append(playlist_sim)
+        # is compilation
+        sim_vec.append(self.compilation == other.compilation)
+        # TODO: has artwork
+        # duration
+        duration_diff = abs(self.duration - other.duration)
+        duration_sim = (
+            1 - duration_diff / self.median_song_length
+            if duration_diff <= self.median_song_length
+            else 0
+        )
+        sim_vec.append(duration_sim)
+
+        # return sum(sim_vec) / len(sim_vec)
+
+        alpha = self.score_base  # why not
+        n = len(sim_vec)
+        exp_sum = np.sum(np.exp(alpha * np.array(sim_vec)))
+        max_exp_sum = n * np.exp(alpha)
+        min_exp_sum = n * np.exp(0)
+
+        # Normalize to the range [0, 1]
+        normalized_value = (exp_sum - min_exp_sum) / (max_exp_sum - min_exp_sum)
+        assert isinstance(normalized_value, float)
+        return normalized_value
 
     def display(self) -> str:
         return f"{self.name} - {self.track_artist}"
 
-    def to_dict(self):
+    @classmethod
+    def from_api(cls, api: Any) -> Track:
+        name = api.name() or "Unknown Track"
+        track_artist = api.artist() or "Unknown Track Artist"
+        album = api.album() or "Unknown Album"
+        album_artist = api.album_artist() or "Unknown Album Artist"
+        genre = api.genre() or "Unknown Genre"
+        year = api.year()
+        track_number = api.track_number()
+        play_count = api.played_count()
+        skip_count = api.skipped_count()
+        duration = dt.timedelta(seconds=api.duration())
+        date_added = api.date_added()
+        rating = api.rating()
+        dbid = api.database_ID()
+        shuffleable = api.shufflable()
+        if not shuffleable:
+            logger.warning(f"{name} - {track_artist} is not shuffleable")
+        compilation = api.compilation()
+        size = api.size()
+        favorite = api.favorited()
+        last_played = api.played_date()
+        last_skipped = api.skipped_date()
+
+        # TODO: just handle the optionals
+        if last_played == k.missing_value:
+            last_played = NOW - 100 * ONE_YEAR
+        if last_skipped == k.missing_value:
+            last_skipped = NOW - 100 * ONE_YEAR
+
+        duration_since_last_played = NOW - last_played
+        duration_since_last_skipped = NOW - last_skipped
+        time_spent_listening = play_count * duration
+        duration_since_added = NOW - date_added
+        years_since_added = duration_since_added / ONE_YEAR
+
+        duration_since_last_interaction = min(
+            duration_since_last_played, duration_since_last_skipped
+        )
+
+        play_rate = play_count / years_since_added
+        skip_rate = skip_count / years_since_added
+        listen_rate = time_spent_listening / years_since_added
+        norm_listen_rate = listen_rate / cls.median_song_length
+        net_rate = (play_rate + norm_listen_rate - skip_rate) / 2
+        if net_rate > 0:
+            time_between_plays = ONE_YEAR / net_rate
+        else:
+            time_between_plays = 100 * ONE_YEAR
+        overdue_duration = duration_since_last_interaction - time_between_plays
+        overdue = overdue_duration / time_between_plays
+        score = math.log(1 + net_rate, cls.score_base)
+
+        # get the playlist objects
+        playlists: List[str] = []
+        if cls.loaded_playlists:
+            playlists.extend(
+                track_playlist.name()
+                for track_playlist in api.playlists.get()
+                if track_playlist in cls.loaded_playlists
+            )
+
+        return cls(
+            api=api,
+            name=name,
+            track_artist=track_artist,
+            album=album,
+            album_artist=album_artist,
+            genre=genre,
+            year=year,
+            track_number=track_number,
+            play_count=play_count,
+            skip_count=skip_count,
+            duration=duration,
+            date_added=date_added,
+            rating=rating,
+            dbid=dbid,
+            compilation=compilation,
+            size=size,
+            favorite=favorite,
+            last_played=last_played,
+            last_skipped=last_skipped,
+            duration_since_last_played=duration_since_last_played,
+            duration_since_last_skipped=duration_since_last_skipped,
+            duration_since_added=duration_since_added,
+            duration_since_last_interaction=duration_since_last_interaction,
+            play_rate=play_rate,
+            skip_rate=skip_rate,
+            listen_rate=listen_rate,
+            net_rate=net_rate,
+            score=score,
+            time_between_plays=time_between_plays,
+            overdue_duration=overdue_duration,
+            overdue=overdue,
+            playlists=playlists,
+        )
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> Track:
+        return cls(
+            api=None,
+            name=data["name"],
+            track_artist=data["track_artist"],
+            album=data["album"],
+            album_artist=data["album_artist"],
+            genre=data["genre"],
+            year=data["year"],
+            track_number=data["track_number"],
+            play_count=data["play_count"],
+            skip_count=data["skip_count"],
+            duration=dt.timedelta(minutes=data["duration"]),
+            duration_since_added=dt.timedelta(days=data["years_since_added"] * 365.25),
+            duration_since_last_played=dt.timedelta(
+                days=data["days_since_last_played"]
+            ),
+            duration_since_last_skipped=dt.timedelta(
+                days=data["days_since_last_skipped"]
+            ),
+            duration_since_last_interaction=dt.timedelta(
+                days=data["days_since_last_interaction"]
+            ),
+            date_added=dt.datetime.fromisoformat(data["date_added"]),
+            rating=int(data["rating"] * 20),
+            score=data["score"],
+            time_between_plays=dt.timedelta(days=data["days_between_plays"]),
+            overdue_duration=dt.timedelta(days=data["days_overdue"]),
+            overdue=data["overdue"],
+            play_rate=data["play_rate"],
+            skip_rate=data["skip_rate"],
+            listen_rate=dt.timedelta(minutes=data["listen_rate"]),
+            net_rate=data["net_rate"],
+            dbid=data["dbid"],
+            compilation=data["compilation"],
+            size=data["size"],
+            favorite=data["favorite"],
+            last_played=NOW - data["days_since_last_played"] * ONE_DAY,
+            last_skipped=NOW - data["days_since_last_skipped"] * ONE_DAY,
+            playlists=data["playlists"],
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "track_artist": self.track_artist,
@@ -137,13 +311,26 @@ class Track:
             "play_count": self.play_count,
             "skip_count": self.skip_count,
             "duration": self.duration / ONE_MIN,
-            "rating": self.rating,
+            "rating": self.rating / 20,
             "date_added": self.date_added.isoformat(),
-            "duration_since_added": self.duration_since_added / ONE_YEAR,
+            "years_since_added": self.duration_since_added / ONE_YEAR,
+            "days_since_last_played": self.duration_since_last_played / ONE_DAY,
+            "days_since_last_skipped": self.duration_since_last_skipped / ONE_DAY,
+            "days_since_last_interaction": (
+                self.duration_since_last_interaction / ONE_DAY
+            ),
             "play_rate": self.play_rate,
+            "skip_rate": self.skip_rate,
             "listen_rate": self.listen_rate / ONE_MIN,
+            "net_rate": self.net_rate,
+            "days_between_plays": self.time_between_plays / ONE_DAY,
             "score": self.score,
+            "days_overdue": self.overdue_duration / ONE_DAY,
+            "overdue": self.overdue,
             "playlists": sorted(self.playlists),
+            "compilation": self.compilation,
+            "favorite": self.favorite,
+            "size": self.size,
             "dbid": self.dbid,
         }
 
@@ -158,43 +345,55 @@ class Track:
             )
         )
 
-    def get_all_playlists(self) -> List[Any]:
-        return self._api.playlists.get()
-
-    def set_rating(self, rating: int) -> None:
+    def set_rating(self, rating: int, *, active: bool) -> None:
+        assert self.api is not None
         assert 0 <= rating <= 100
-        self._api.rating.set(rating)
         self.rating = rating
+        if active:
+            self.api.rating.set(rating)
 
     def set_favorite_status(self, status: FavoriteStatus) -> None:
+        assert self.api is not None
         if status == FavoriteStatus.FAVORITED:
-            if self._api.favorited.get() is False:
+            if self.api.favorited.get() is False:
                 logger.info(f"💗 {self.display()}")
-                self._api.favorited.set(True)
+                self.api.favorited.set(True)
+                self.favorite = True
         elif status == FavoriteStatus.DISLIKED:
-            if self._api.disliked.get() is False:
+            if self.api.disliked.get() is False:
                 logger.info(f"😾 {self.display()}")
-                self._api.disliked.set(True)
+                self.api.disliked.set(True)
         elif status == FavoriteStatus.NONE:
-            if self._api.favorited.get() is True:
+            if self.api.favorited.get() is True:
                 logger.info(f"💔 {self.display()}")
-                self._api.favorited.set(False)
-            if self._api.disliked.get() is True:
+                self.api.favorited.set(False)
+                self.favorite = False
+            if self.api.disliked.get() is True:
                 logger.info(f"🫤 {self.display()}")
-                self._api.disliked.set(False)
+                self.api.disliked.set(False)
         else:
             raise ValueError(f"Invalid favorite status: {status}")
 
     def add_to_playlist(self, playlist: Any) -> None:
-        self._api.duplicate(to=playlist)
+        assert self.api is not None
+        self.api.duplicate(to=playlist)
+
+
+def median(values: List[float]) -> float:
+    count = len(values)
+    sorted_values = sorted(values)
+    half = count // 2
+    if count & 1:
+        return sorted_values[half]
+    return (sorted_values[half - 1] + sorted_values[half]) / 2
 
 
 @dataclass
 class MetadataStats:
     total: float = field(init=False)
-    median_total: float = field(init=False)
     avg: float = field(init=False)
     median: float = field(init=False)
+    median_total: float = field(init=False)
     max: float = field(init=False)
     min: float = field(init=False)
     std_dev: float = field(init=False)
@@ -204,41 +403,37 @@ class MetadataStats:
     to_display: Callable[[float], str] = str
     to_json: Callable[[float], Any] = lambda x: x
 
-    def __post_init__(self, values):
+    def __post_init__(self, values: List[float]) -> None:
         count = len(values)
         assert count > 0
         value_type = type(values[0])
         self.total = sum(values, start=value_type())
         self.avg = self.total / count
-        sorted_values = sorted(values)
-        half = count // 2
-        if count & 1:
-            self.median = sorted_values[half]
-        else:
-            self.median = (sorted_values[half - 1] + sorted_values[half]) / 2
+        self.median = median(values)
         self.median_total = self.median * count
         self.max = max(values)
         self.min = min(values)
         self.std_dev = (sum((x - self.avg) ** 2 for x in values) / count) ** 0.5
         self.mode = max(set(values), key=values.count)
 
-    def __str__(self):
+    def __str__(self) -> str:
         return "\n".join(
             [
                 f"Total: {self.to_display(self.total)}",
                 f"Avg: {self.to_display(self.avg)}",
                 f"Median: {self.to_display(self.median)}",
+                f"Median Total: {self.to_display(self.median_total)}",
                 f"Max: {self.to_display(self.max)}",
                 f"Min: {self.to_display(self.min)}",
             ]
         )
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "total": self.to_json(self.total),
-            "total_median": self.to_json(self.median_total),
             "avg": self.to_json(self.avg),
             "median": self.to_json(self.median),
+            "median_total": self.to_json(self.median_total),
             "max": self.to_json(self.max),
             "min": self.to_json(self.min),
             "std_dev": self.to_json(self.std_dev),
@@ -255,18 +450,24 @@ class TrackCollection:
     score: MetadataStats = field(init=False)
     play_rate: MetadataStats = field(init=False)
     listen_rate: MetadataStats = field(init=False)
+    skip_rate: MetadataStats = field(init=False)
+    net_rate: MetadataStats = field(init=False)
+    days_between_plays: MetadataStats = field(init=False)
+    overdue: MetadataStats = field(init=False)
     duration: MetadataStats = field(init=False)
     play_count: MetadataStats = field(init=False)
     skip_count: MetadataStats = field(init=False)
     rating: MetadataStats = field(init=False)
     year: MetadataStats = field(init=False)
     track_number: MetadataStats = field(init=False)
-    duration_since_added: MetadataStats = field(init=False)
+    years_since_added: MetadataStats = field(init=False)
+    days_since_last_played: MetadataStats = field(init=False)
     num_playlists: MetadataStats = field(init=False)
+    size: MetadataStats = field(init=False)
 
     tracks: InitVar[List[Track]]
 
-    def __post_init__(self, tracks):
+    def __post_init__(self, tracks: List[Track]) -> None:
         self.count = len(tracks)
         self.score = MetadataStats(
             [track.score for track in tracks],
@@ -274,12 +475,29 @@ class TrackCollection:
         )
         self.play_rate = MetadataStats(
             [track.play_rate for track in tracks],
-            to_display=lambda x: f"{x:.2f} plays/year",
+            to_display=lambda x: f"{x:.2f}",
         )
         self.listen_rate = MetadataStats(
             [track.listen_rate.total_seconds() for track in tracks],
             to_json=lambda x: x / 60,  # seconds to min
-            to_display=lambda x: f"{dt.timedelta(seconds=x)} per year",
+            to_display=lambda x: f"{dt.timedelta(seconds=x)}",
+        )
+        self.skip_rate = MetadataStats(
+            [track.skip_rate for track in tracks],
+            to_display=lambda x: f"{x:.2f}",
+        )
+        self.net_rate = MetadataStats(
+            [track.net_rate for track in tracks],
+            to_display=lambda x: f"{x:.2f}",
+        )
+        self.days_between_plays = MetadataStats(
+            [track.time_between_plays.total_seconds() for track in tracks],
+            to_json=lambda x: x / 60 / 60 / 24,  # seconds to days
+            to_display=lambda x: f"{dt.timedelta(seconds=x)}",
+        )
+        self.overdue = MetadataStats(
+            [track.overdue for track in tracks],
+            to_display=lambda x: f"{x:.2f}%",
         )
         self.duration = MetadataStats(
             values=[track.duration.total_seconds() for track in tracks],
@@ -288,15 +506,16 @@ class TrackCollection:
         )
         self.play_count = MetadataStats(
             values=[track.play_count for track in tracks],
-            to_display=lambda x: f"{x:.1f} plays",
+            to_display=lambda x: f"{x:.1f}",
         )
         self.skip_count = MetadataStats(
             values=[track.skip_count for track in tracks],
-            to_display=lambda x: f"{x:.1f} skips",
+            to_display=lambda x: f"{x:.1f}",
         )
         self.rating = MetadataStats(
             values=[track.rating for track in tracks],
-            to_display=lambda x: f"{x:.1f}",
+            to_display=lambda x: f"{x/20:.2f}★",
+            to_json=lambda x: x / 20,
         )
         self.year = MetadataStats(
             values=[track.year for track in tracks],
@@ -304,17 +523,28 @@ class TrackCollection:
         self.track_number = MetadataStats(
             values=[track.track_number for track in tracks],
         )
-        self.duration_since_added = MetadataStats(
+        self.years_since_added = MetadataStats(
             values=[track.duration_since_added.total_seconds() for track in tracks],
             to_json=lambda x: x / 60 / 60 / 24 / 365.25,  # seconds to years
             to_display=lambda x: str(dt.timedelta(seconds=x)),
         )
+        self.days_since_last_played = MetadataStats(
+            values=[
+                track.duration_since_last_played.total_seconds() for track in tracks
+            ],
+            to_json=lambda x: x / 60 / 60 / 24,  # seconds to days
+            to_display=lambda x: str(dt.timedelta(seconds=x)),
+        )
         self.num_playlists = MetadataStats(
             values=[len(track.playlists) for track in tracks],
-            to_display=lambda x: f"{x:.1f} playlists",
+            to_display=lambda x: f"{x:.1f}",
+        )
+        self.size = MetadataStats(
+            values=[track.size for track in tracks],
+            to_display=human_readable_size,
         )
 
-    def __str__(self):
+    def __str__(self) -> str:
         return "\n".join(
             [
                 f"{self.name}:",
@@ -324,30 +554,42 @@ class TrackCollection:
                 f"  {name}:\n{textwrap.indent(str(metadata), '    ')}"
                 for name, metadata in {
                     "Score": self.score,
-                    "Play Rate": self.play_rate,
-                    "Listen Rate": self.listen_rate,
+                    # "Play Rate": self.play_rate,
+                    # "Listen Rate": self.listen_rate,
+                    # "Skip Rate": self.skip_rate,
+                    "Net Rate": self.net_rate,
+                    "Days Between Plays": self.days_between_plays,
+                    # "Overdue": self.overdue,
                     "Duration": self.duration,
-                    "Play Count": self.play_count,
+                    # "Days Since Last Played": self.days_since_last_played,
+                    # "Play Count": self.play_count,
                     # "Rating": self.rating,
+                    "Size": self.size,
                 }.items()
             ]
         )
 
-    def to_dict(self):
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "name": self.name,
             "count": self.count,
             "score": self.score.to_dict(),
             "play_rate": self.play_rate.to_dict(),
             "listen_rate": self.listen_rate.to_dict(),
+            "skip_rate": self.skip_rate.to_dict(),
+            "net_rate": self.net_rate.to_dict(),
+            "days_between_plays": self.days_between_plays.to_dict(),
+            "overdue": self.overdue.to_dict(),
             "duration": self.duration.to_dict(),
             "play_count": self.play_count.to_dict(),
             "skip_count": self.skip_count.to_dict(),
             "rating": self.rating.to_dict(),
             "year": self.year.to_dict(),
             "track_number": self.track_number.to_dict(),
-            "duration_since_added": self.duration_since_added.to_dict(),
+            "years_since_added": self.years_since_added.to_dict(),
+            "days_since_last_played": self.days_since_last_played.to_dict(),
             "num_playlists": self.num_playlists.to_dict(),
+            "size": self.size.to_dict(),
         }
 
 
@@ -367,10 +609,21 @@ class Config:
         @dataclass
         class Input:
             source_playlist: str
-            subset_playlist: Optional[str]
-            save_stats: bool
+            playlist_folder: Optional[str]
 
         input: Input
+
+        @dataclass
+        class Stats:
+            name: str
+            save_totals: bool
+            show_totals: bool
+            save_tracks: bool
+            show_track_diff: bool
+            save_collections: bool
+            show_collection_diff: bool
+
+        stats: List[Stats]
 
         @dataclass
         class Output:
@@ -382,10 +635,21 @@ class Config:
             class Shuffle:
                 enabled: bool
                 name: Optional[str]
+                parent_playlist: Optional[str]
+                save_tracks: bool
                 downranked_genres: List[str]
                 downranked_artists: List[str]
 
             shuffle: Shuffle
+
+            @dataclass
+            class Overdue:
+                enabled: bool
+                name: Optional[str]
+                parent_playlist: Optional[str]
+                save_tracks: bool
+
+            overdue: Overdue
 
         output: Output
 
@@ -410,13 +674,6 @@ class Config:
 
     favorites: Favorites
 
-    @dataclass
-    class Collections:
-        save_stats: bool
-        playlist_folder: Optional[str]
-
-    collections: Collections
-
     # or is the real monster python
 
     @classmethod
@@ -431,9 +688,20 @@ class Config:
             playlists=cls.Playlists(
                 input=cls.Playlists.Input(
                     source_playlist=data["playlists"]["input"]["source_playlist"],
-                    subset_playlist=data["playlists"]["input"].get("subset_playlist"),
-                    save_stats=data["playlists"]["input"]["save_stats"],
+                    playlist_folder=data["playlists"]["input"].get("playlist_folder"),
                 ),
+                stats=[
+                    cls.Playlists.Stats(
+                        name=stat["name"],
+                        save_totals=stat["save_totals"],
+                        show_totals=stat["show_totals"],
+                        save_tracks=stat["save_tracks"],
+                        show_track_diff=stat["show_track_diff"],
+                        save_collections=stat["save_collections"],
+                        show_collection_diff=stat["show_collection_diff"],
+                    )
+                    for stat in data["playlists"]["stats"]
+                ],
                 output=cls.Playlists.Output(
                     force_update=data["playlists"]["output"]["force_update"],
                     update_every=(
@@ -450,12 +718,28 @@ class Config:
                     shuffle=cls.Playlists.Output.Shuffle(
                         enabled=data["playlists"]["output"]["shuffle"]["enabled"],
                         name=data["playlists"]["output"]["shuffle"].get("name"),
+                        parent_playlist=data["playlists"]["output"]["shuffle"].get(
+                            "parent_playlist"
+                        ),
+                        save_tracks=data["playlists"]["output"]["shuffle"][
+                            "save_tracks"
+                        ],
                         downranked_genres=data["playlists"]["output"]["shuffle"].get(
                             "downranked_genres", []
                         ),
                         downranked_artists=data["playlists"]["output"]["shuffle"].get(
                             "downranked_artists", []
                         ),
+                    ),
+                    overdue=cls.Playlists.Output.Overdue(
+                        enabled=data["playlists"]["output"]["overdue"]["enabled"],
+                        name=data["playlists"]["output"]["overdue"].get("name"),
+                        parent_playlist=data["playlists"]["output"]["overdue"].get(
+                            "parent_playlist"
+                        ),
+                        save_tracks=data["playlists"]["output"]["overdue"][
+                            "save_tracks"
+                        ],
                     ),
                 ),
             ),
@@ -465,28 +749,43 @@ class Config:
                 update=data["favorites"]["update"],
                 top_percent=data["favorites"].get("top_percent"),
             ),
-            collections=cls.Collections(
-                save_stats=data["collections"]["save_stats"],
-                playlist_folder=data["collections"].get("playlist_folder"),
-            ),
         )
+
+
+def track_iter(tracks: List[Track], *, active: bool = True) -> tqdm.tqdm[Track]:
+    return tqdm.tqdm(
+        tracks,
+        unit="track",
+        mininterval=PROGRESS_INTERVAL,
+        # bar_format="{l_bar}{bar}| ",
+        disable=not active,
+    )
 
 
 def init_logger(level: int) -> None:
     root = logging.getLogger()
-    root.setLevel(level)
+    root.setLevel(logging.DEBUG)
     console_handler = logging.StreamHandler()
     formatter = ColoredFormatter("%(log_color)s[%(levelname)s]%(reset)s %(message)s")
     console_handler.setFormatter(formatter)
+    console_handler.setLevel(level)
     root.addHandler(console_handler)
-    # also save to log.txt
+    # also save to log.txt at debug level
     root.debug(f"Logging to {LOG_PATH}")
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     file_handler = logging.FileHandler(LOG_PATH, mode="a", encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter("%(levelname)s: %(message)s"))
     root.addHandler(file_handler)
 
 
-def update_track_params(subdir_name: str):
+def update_track_params(music_app: Any, config: Config) -> None:
+    Track.set_down_ranked(
+        artists=config.playlists.output.shuffle.downranked_artists,
+        genres=config.playlists.output.shuffle.downranked_genres,
+    )
+
+    subdir_name = config.playlists.input.source_playlist
     totals_path = OUTPUT_DIR / subdir_name / "totals.json"
     if totals_path.exists():
         with totals_path.open("r", encoding="utf-8") as total_json_file:
@@ -497,38 +796,41 @@ def update_track_params(subdir_name: str):
         Track.median_song_length = median_duration
         # update score base so that avg score is equal to target
         if TARGET_MEDIAN_SCORE is not None:
-            avg_play_rate = total_data[0]["play_rate"]["median"]
-            listen_rate = total_data[0]["listen_rate"]["median"]
-            norm_listen_rate = listen_rate / median_duration_min
-            rate_avg = (avg_play_rate + norm_listen_rate) / 2
-            if TARGET_MEDIAN_SCORE == 1.0:
-                n = 1 + rate_avg
+            net_rate = total_data[0]["net_rate"]["median"]
+            if math.isclose(TARGET_MEDIAN_SCORE, 1.0):
+                n = 1 + net_rate
             else:
-                n = (1 + rate_avg) ** (1 / TARGET_MEDIAN_SCORE)
+                n = (1 + net_rate) ** (1 / TARGET_MEDIAN_SCORE)
             Track.score_base = n
     else:
         logger.warning(f"Could not find {totals_path}")
     logger.info(f"Median song length: {Track.median_song_length}")
     logger.info(f"Score base: {Track.score_base:.3f}")
 
+    if config.playlists.input.playlist_folder is not None:
+        Track.loaded_playlists = load_playlists_from_folder(
+            music_app, config.playlists.input.playlist_folder
+        )
 
-def update_track_ratings(tracks: List[Track]) -> None:
+
+def update_track_ratings(tracks: List[Track], *, active: bool) -> None:
     logger.info("Updating track ratings")
     num_bins = min(100, len(tracks))
+    assert num_bins > 0
     bin_size = len(tracks) / num_bins
-    # TODO: debug
-    logger.info(f"num bins: {num_bins}, bin size: {bin_size}")
-    for i, track in enumerate(tracks):
+    logger.debug(f"Tracks per 0.05 stars: {bin_size:.1f}")
+    for i, track in enumerate(track_iter(tracks, active=active)):
         if track.play_count > 0:
             rating = 100 - int(i // bin_size)
         else:
             rating = 0
-        track.set_rating(rating)
+        track.set_rating(rating, active=active)
 
 
 def update_favorites(tracks: List[Track], fav_percent: float) -> None:
     logger.info("Updating favorites")
     fav_limit = round(len(tracks) * (fav_percent / 100))
+    # assumes sorted
     for i, track in enumerate(tracks):
         if i < fav_limit:
             favorited = FavoriteStatus.FAVORITED
@@ -540,37 +842,104 @@ def update_favorites(tracks: List[Track], fav_percent: float) -> None:
 def weighted_shuffle(tracks: List[Track]) -> List[Track]:
     logger.info("Shuffling tracks")
 
-    # TODO: better weighted shuffle? random.sample?
-    def weight(track: Track) -> float:
+    # set random seed based on day
+    seed = NOW.toordinal()
+    random.seed(seed)
+
+    shuffled = []
+    tracks = tracks.copy()
+    # tracks.sort(key=lambda x: x.score, reverse=True)
+    weights = []
+    # median_net_rate = Track.score_base ** TARGET_MEDIAN_SCORE - 1
+    for track in tracks:
+        # if track.net_rate != 0:
+        #     weight = track.net_rate
+        # else:
+        #     weight = median_net_rate
+        if track.score != 0:
+            weight = track.score
+        else:
+            weight = TARGET_MEDIAN_SCORE
         if track.is_downranked():
-            logger.debug(f"Downranking {track.display()}")
-            # min(rand, rand) is linear towards 0
-            # rand * rand is higher near 0
-            # rand ** 2 is much near 0
-            return min(random.random(), random.random()) * track.score
+            weight /= 2
+        elif track.favorite:
+            weight *= 2
+        # adjust weight by overdue percentage
+        weight *= 1 + track.overdue
+        weights.append(weight)
+    tic = time.perf_counter()
+    # raise weights to a minimum floor (to avoid negative and zero weights)
+    min_weight = min(weights)
+    weight_floor = 0.01
+    weights = [weight - min_weight + weight_floor for weight in weights]
+    # sims = [0.0] * len(tracks)
+    total_weight = sum(weights)
+    while tracks:
+        # similarity.... it was a nice idea
+        # adjusted_weights = [weight * (1 + sim) for weight, sim in zip(weights, sims)]
+        # total_adjusted_weight = sum(adjusted_weights)
+        adjusted_weights = weights
+        total_adjusted_weight = total_weight
+        r = random.uniform(0, total_adjusted_weight)
+        for i, weight in enumerate(adjusted_weights):
+            r -= weight
+            if r <= 0:
+                picked = tracks.pop(i)
+                shuffled.append(picked)
+                # logger.debug(
+                # f"{picked.display()} ({weights[i]:.3f}, {sims[i]:.3f}, {weight:.3f})")
+                logger.debug(f"{picked.display()} ({weights[i]:.3f})")
+                del weights[i]
+                total_weight -= weight
+                # del sims[i]
+                # for i, track in enumerate(tracks):
+                #     sims[i] = (sims[i] * 0.5) + (picked.similarity_to(track) * 0.5)
+                break
+        else:
+            raise RuntimeError("Weighted shuffle failed")
+    toc = time.perf_counter()
+    logger.debug(f"Shuffled in {toc - tic:.2f} seconds")
+    logger.debug(f"Weighted shuffle error: {total_weight}")
+    return shuffled
 
-        return random.random() * track.score
 
-    return sorted(
-        tracks,
-        key=weight,
-        reverse=True,
-    )
+class PlaylistLoader:
+
+    def __init__(self, music_app: Any) -> None:
+        self.music_app = music_app
+
+        self.tracks_by_dbid: Dict[int, Track] = {}
+        self.tracks_by_playlist: Dict[str, List[Track]] = {}
+
+    def load(self, playlist_name: str) -> List[Track]:
+        if (tracks := self.tracks_by_playlist.get(playlist_name)) is not None:
+            return tracks
+
+        playlist = self.music_app.playlists[playlist_name]
+        if not playlist.exists():
+            raise ValueError(f"Playlist {playlist_name!r} does not exist")
+
+        logger.info(f"Loading playlist {playlist_name!r}")
+        out = []
+        tracks_to_process = []
+        for track in playlist.tracks():
+            dbid = track.database_ID()
+            if (track_obj := self.tracks_by_dbid.get(dbid)) is not None:
+                out.append(track_obj)
+            else:
+                tracks_to_process.append(track)
+        if tracks_to_process:
+            for track in track_iter(tracks_to_process):
+                track_obj = Track.from_api(api=track)
+                self.tracks_by_dbid[track_obj.dbid] = track_obj
+                out.append(track_obj)
+        out.sort(key=lambda x: x.score, reverse=True)
+        self.tracks_by_playlist[playlist_name] = out
+        return out
 
 
-def process_source(music_app, playlist_name: str):
-    logger.info(f"Retrieving tracks from {playlist_name!r}")
-    source_tracks = music_app.playlists[playlist_name].tracks()
-
-    logger.info(f"Processing tracks ({len(source_tracks)})")
-    tracks = []
-    for track in tqdm.tqdm(source_tracks, unit="track", mininterval=PROGRESS_INTERVAL):
-        tracks.append(Track(api=track))
-    return tracks
-
-
-def attach_playlists(music_app, tracks, playlist_folder: str) -> None:
-    logger.info("Retrieving playlists")
+def load_playlists_from_folder(music_app: Any, playlist_folder: str) -> Set[Any]:
+    logger.info(f"Retrieving playlists from {playlist_folder}")
     folders_to_check = {music_app.playlists[playlist_folder].get()}
     folder_playlists = set()
     while folders_to_check:
@@ -586,16 +955,12 @@ def attach_playlists(music_app, tracks, playlist_folder: str) -> None:
                 folders_to_check.add(playlist)
             elif kind == k.none:
                 folder_playlists.add(playlist)
-    logging.info(f"Attaching playlists ({len(folder_playlists)}) to tracks")
-    for track in tqdm.tqdm(tracks, unit="track", mininterval=PROGRESS_INTERVAL):
-        track.playlists.extend(
-            track_playlist.name()
-            for track_playlist in track.get_all_playlists()
-            if track_playlist in folder_playlists
-        )
+    return folder_playlists
 
 
-def update_playlist(*, music_app: Any, source_tracks, playlist_name: str) -> None:
+def update_playlist(
+    *, music_app: Any, source_tracks: List[Track], playlist_name: str
+) -> None:
     playlist = music_app.playlists[playlist_name]
     if not playlist.exists():
         logger.info(f"Creating playlist {playlist_name!r}")
@@ -609,11 +974,13 @@ def update_playlist(*, music_app: Any, source_tracks, playlist_name: str) -> Non
 
     logger.info(f"Adding tracks to {playlist_name!r}")
     # use tqdm to show progress
-    for track in tqdm.tqdm(source_tracks, unit="track", mininterval=PROGRESS_INTERVAL):
+    for track in track_iter(source_tracks):
         track.add_to_playlist(playlist)
 
 
-def remove_unsynced_tracks(music_app, synced_tracks, playlist_name: str) -> None:
+def remove_unsynced_tracks(
+    music_app: Any, synced_tracks: List[Track], playlist_name: str
+) -> None:
     playlist = music_app.playlists[playlist_name]
     if not playlist.exists():
         logger.info(f"Playlist {playlist_name!r} does not exist")
@@ -624,9 +991,7 @@ def remove_unsynced_tracks(music_app, synced_tracks, playlist_name: str) -> None
         track for track in playlist.tracks() if track.database_ID() not in synced_dbids
     ]
 
-    logger.info(
-        f"Removing {len(unsynced_tracks)} unsynced tracks from {playlist_name!r}"
-    )
+    logger.info(f"Removing {len(unsynced_tracks)} tracks from {playlist_name!r}")
     for track in unsynced_tracks:
         track.delete()
 
@@ -638,12 +1003,15 @@ def save_track_data(tracks: List[Track], subdir_name: str, show_diff: bool) -> N
         name="tracks",
         show_diff=show_diff,
         key=lambda x: x["dbid"],
-        sentinel=lambda x: x["play_count"] + x["skip_count"],
+        rating=lambda x: x["rating"],
+        counts=lambda x: x["play_count"] + x["skip_count"],
+        # score=lambda x: x["score"],
+        score=lambda x: x["net_rate"],
         pretty=lambda x: f"{x['name']} - {x['track_artist']}",
     )
 
 
-def save_collection_stats(tracks: List[Track], subdir_name: str):
+def save_collection_stats(tracks: List[Track], *, subdir_name: str) -> None:
     album_artists = defaultdict(list)
     track_artists = defaultdict(list)
     albums = defaultdict(list)
@@ -692,12 +1060,16 @@ def save_collection_stats(tracks: List[Track], subdir_name: str):
             name=collection_name,
             show_diff=True,
             key=lambda x: x["name"],
-            sentinel=lambda x: x["play_count"]["total"] + x["skip_count"]["total"],
+            rating=lambda x: x["rating"]["avg"],
+            counts=lambda x: x["play_count"]["total"] + x["skip_count"]["total"],
+            score=None,
             pretty=None,
         )
 
 
-def save_total_stats(tracks, subdir_name: str):
+def save_total_stats(
+    tracks: List[Track], *, subdir_name: str, show_stats: bool
+) -> None:
     source = TrackCollection(name=subdir_name, tracks=tracks)
     save_data(
         data=[source.to_dict()],
@@ -705,20 +1077,25 @@ def save_total_stats(tracks, subdir_name: str):
         name="totals",
         show_diff=False,
         key=None,
-        sentinel=None,
+        rating=None,
+        score=None,
+        counts=None,
         pretty=None,
     )
-    logger.info(source)
+    if show_stats:
+        logger.info(source)
 
 
 def save_data(
     *,
-    data,
+    data: List[Dict[str, Any]],
     subdir_name: str,
     name: str,
     show_diff: bool,
     key: Optional[Any],
-    sentinel: Optional[Any],
+    rating: Optional[Any],
+    score: Optional[Any],
+    counts: Optional[Any],
     pretty: Optional[Any],
 ) -> None:
     json_subdir = OUTPUT_DIR / subdir_name
@@ -726,7 +1103,7 @@ def save_data(
     json_path = json_subdir / f"{name}.json"
 
     # grab existing file for later if it exists
-    existing_data: Optional[List[dict]]
+    existing_data: Optional[List[Dict[str, Any]]]
     if show_diff and json_path.exists():
         with json_path.open("r", encoding="utf-8") as json_file:
             existing_data = json.load(json_file)
@@ -734,49 +1111,92 @@ def save_data(
         existing_data = None
 
     data = [{"index": i, **item} for i, item in enumerate(data)]
+
+    if show_diff and existing_data is not None and data != existing_data:
+        assert key is not None
+        assert rating is not None
+        assert counts is not None
+        show_diffs(
+            current=data,
+            previous=existing_data,
+            name=name,
+            key=key,
+            rating=rating,
+            score=score,
+            counts=counts,
+            pretty=pretty,
+        )
+
     with json_path.open("w", encoding="utf-8") as json_file:
         json.dump(data, json_file, ensure_ascii=False, indent=4)
     logger.debug(f"Saved {json_path}")
 
-    if show_diff and existing_data is not None and data != existing_data:
-        assert key is not None
-        assert sentinel is not None
-        prev_items_by_key = {key(item): item for item in existing_data}
-        diff_list = []
-        total_diff = 0
-        for item in data:
-            prev_item = prev_items_by_key.get(key(item))
+
+def show_diffs(
+    current: List[Dict[str, Any]],
+    previous: List[Dict[str, Any]],
+    name: str,
+    key: Callable[[Dict[str, Any]], Any],
+    rating: Callable[[Dict[str, Any]], float],
+    counts: Callable[[Dict[str, Any]], float],
+    score: Optional[Callable[[Dict[str, Any]], float]],
+    pretty: Optional[Callable[[Dict[str, Any]], str]],
+) -> None:
+    rating_diff_threshold = 0.01
+    pretty_diff: Callable[[float], str] = lambda x: f"{x:+.2f}"
+    pretty_rating: Callable[[Dict[str, Any]], str] = lambda x: f"{rating(x):.2f}★"
+    score_diff_threshold = 0.01
+
+    prev_items_by_key = {key(item): item for item in previous}
+    diff_list = []
+    total_diff = 0.0
+    for item in current:
+        prev_item = prev_items_by_key.get(key(item))
+        pretty_name = pretty(item) if pretty else key(item)
+        if prev_item is None:
+            if score is not None:
+                total_diff += score(item)
+            diff_list.append(f"ADD    {pretty_rating(item)} {pretty_name}")
+        else:
+            if score is not None:
+                total_diff += score(item) - score(prev_item)
+            if counts(item) != counts(prev_item):
+                item_rating = rating(item)
+                rating_diff = item_rating - rating(prev_item)
+                abs_rating_diff = abs(rating_diff)
+                if abs_rating_diff >= rating_diff_threshold:
+                    if rating_diff > 0:
+                        disp = " " + pretty_diff(rating_diff)
+                    else:
+                        disp = pretty_diff(rating_diff) + " "
+                    diff_list.append(f"{disp} {pretty_rating(item)} {pretty_name}")
+    current_keys = {key(item) for item in current}
+    for item in previous:
+        if key(item) not in current_keys:
+            if score is not None:
+                total_diff -= score(item)
             pretty_name = pretty(item) if pretty else key(item)
-            if prev_item is None:
-                diff_list.append(f"  ADD {item['index']: >5}. {pretty_name}")
-            elif (diff := item["index"] - prev_item["index"]) and sentinel(
-                item
-            ) != sentinel(prev_item):
-                abs_diff = abs(diff)
-                total_diff += abs_diff
-                diff_list.append(f"{-diff: >+5} {item['index']: >5}. {pretty_name}")
-        current_keys = {key(item) for item in data}
-        for item in existing_data:
-            if key(item) not in current_keys:
-                pretty_name = pretty(item) if pretty else key(item)
-                diff_list.append(f"  DEL {item['index']: >5}. {pretty_name}")
-        if diff_list:
-            logger.info(f"{name} diff:")
-            for line in diff_list:
-                logger.info(line)
-        logger.debug(f"Total {name} diff: {total_diff}")
+            diff_list.append(f"DEL    {pretty_rating(item)} {pretty_name}")
+    if diff_list:
+        diff_str = f"{name} ratings:\n" + "\n".join(diff_list)
+        logger.info(diff_str)
+    if abs(total_diff) > score_diff_threshold:
+        logger.info(f"{name} total score: {total_diff:+.2f}")
+    avg_diff = total_diff / len(current)
+    if abs(avg_diff) > score_diff_threshold:
+        logger.info(f"{name} avg score: {avg_diff:+.2f}")
 
 
-def print_ui_tree(root: Any):
+def print_ui_tree(root: Any, *, actions: bool = True) -> None:
     root = root.get()
 
-    def print_tree(node, indent):
-        for action in node.actions.get():
-            print(f"{' ' * indent}[{action.name()}]")
+    def print_tree(node: Any, indent: int) -> None:
+        if actions:
+            for action in node.actions.get():
+                print(f"{' ' * indent}[{action.name()}]")
         for child in node.UI_elements.get():
-            name = str(child)
-            name = name.replace(str(node), "")
-            name = name.replace(str(root), "")
+            base = node if indent == 0 else root
+            name = str(child).replace(str(base), "")
             print(f"{'.' * indent}{name}")
             print_tree(child, indent + 1)
 
@@ -835,7 +1255,11 @@ def open_new_device_window(finder: Any, device_name: str) -> Any:
     return finder.windows[device_name]
 
 
-def wait_for_ui(cond, *, timeout: dt.timedelta) -> None:
+def wait_for_ui(
+    cond: Callable[[], bool],
+    *,
+    timeout: dt.timedelta,
+) -> None:
     start = dt.datetime.now()
     while not cond():
         if dt.datetime.now() - start > timeout:
@@ -859,9 +1283,8 @@ def sync_device(device_name: str) -> bool:
             device_window = open_new_device_window(finder, device_name)
         devices_ui = device_window.splitter_groups[1].splitter_groups[1]
 
-        # print_ui_tree(devices_ui)
-
         # start a sync
+        time.sleep(2)
         if butts := devices_ui.buttons[its.name == "Sync"].get():
             butts[0].click()
             logger.info("Sync started")
@@ -878,17 +1301,33 @@ def sync_device(device_name: str) -> bool:
         return True
     except CommandError:
         logger.exception("Error syncing device")
+        # for window in app("System Events").processes["Finder"].windows():
+        #     print_ui_tree(window, actions=False)
         return False
 
 
-def wait_for_amplibraryagent():
-    logger.info("Waiting for AMPLibraryAgent to finish updating library")
+def wait_for_library_update() -> None:
+    logger.info("Waiting for library to update...")
     process_name = "AMPLibraryAgent"
     cmd = ["pgrep", "-x", process_name]
     output = sp.check_output(cmd, universal_newlines=True)
     pid = int(output.strip())
     proc = psutil.Process(pid)
-    cpu_interval = 10
+    cpu_interval = 5
     cpu_threshold = 10
     while proc.cpu_percent(interval=cpu_interval) > cpu_threshold:
         time.sleep(0)
+
+
+def human_readable_size(size: float) -> str:
+    base = 1024
+    if size < base:
+        return f"{size} B"
+    size /= base
+    if size < base:
+        return f"{size:.1f} KB"
+    size /= base
+    if size < base:
+        return f"{size:.1f} MB"
+    size /= base
+    return f"{size:.1f} GB"

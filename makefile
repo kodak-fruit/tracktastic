@@ -1,21 +1,28 @@
 LINT_TARGETS := *.py
 
-.PHONY: update
-update:
+.PHONY: dry-run
+dry-run:
 	.venv/bin/python3 update.py
 
-.PHONY: update-active
-update-active:
+.PHONY: update
+update:
 	.venv/bin/python3 update.py --active
 
 .PHONY: sync
 sync:
 	.venv/bin/python3 sync.py
 
+.PHONY: insights
+insights:
+	.venv/bin/python3 insights.py
+
+.PHONY: plot
+plot:
+	-.venv/bin/python3 plot.py
+
 .PHONY: env
 env:
 	python3 -m venv .venv
-	source .venv/bin/activate
 	.venv/bin/python3 -m pip install -r requirements.txt -U --quiet
 
 .PHONY: clean

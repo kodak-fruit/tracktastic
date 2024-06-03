@@ -13,10 +13,9 @@ from music import (
     ONE_HOUR,
     OUTPUT_DIR,
     Config,
+    PlaylistLoader,
     Track,
-    attach_playlists,
     init_logger,
-    process_source,
     remove_unsynced_tracks,
     save_collection_stats,
     save_total_stats,
@@ -26,7 +25,7 @@ from music import (
     update_playlist,
     update_track_params,
     update_track_ratings,
-    wait_for_amplibraryagent,
+    wait_for_library_update,
     weighted_shuffle,
 )
 
@@ -69,18 +68,17 @@ def cli(
         logger.info("TEST MODE")
 
     # sync the iphone
-    # TODO: add a sentinel that only syncs every so often
     if active and config.sync.enabled:
         assert config.sync.iphone_name, "No iPhone name provided in the config file."
-        sync_device(config.sync.iphone_name)
+        assert sync_device(config.sync.iphone_name)
         logger.info(dt.datetime.now() - NOW)
-        wait_for_amplibraryagent()
+        wait_for_library_update()
         logger.info(dt.datetime.now() - NOW)
 
     music_app = app(name="Music")
 
-    # update track params based on prior runs
-    update_track_params(config.playlists.input.source_playlist)
+    # update track params based on config and prior runs
+    update_track_params(music_app, config)
 
     # get all library tracks
     if active and config.album_ratings.clear:
@@ -90,19 +88,14 @@ def cli(
         # TODO: set rating to 0 for all unsynced tracks
 
     # get all candidate tracks
-    source_tracks = process_source(music_app, config.playlists.input.source_playlist)
-
-    if (
-        config.playlists.input.save_stats or config.collections.save_stats
-    ) and config.collections.playlist_folder is not None:
-        attach_playlists(music_app, source_tracks, config.collections.playlist_folder)
-
-    logger.info("Sorting source tracks")
-    source_tracks.sort(key=lambda x: x.score, reverse=True)
+    playlist_loader = PlaylistLoader(music_app)
+    source_tracks = playlist_loader.load(config.playlists.input.source_playlist)
 
     # set the rating
-    if active and config.track_ratings.update:
-        update_track_ratings(source_tracks)
+    update_track_ratings(source_tracks, active=active and config.track_ratings.update)
+    if active:
+        wait_for_library_update()
+        logger.info(dt.datetime.now() - NOW)
 
     # set favorites
     if active and config.favorites.update:
@@ -111,87 +104,115 @@ def cli(
         ), "No top percent provided in the config file."
         update_favorites(source_tracks, config.favorites.top_percent)
 
-    # get subset of tracks that are synced
-    if config.playlists.input.subset_playlist is not None:
-        logger.info("Getting subset of tracks")
-        subset_dbids = {
-            track.database_ID()
-            for track in music_app.playlists[
-                config.playlists.input.subset_playlist
-            ].tracks()
-        }
-        subset_tracks = [track for track in source_tracks if track.dbid in subset_dbids]
-        logger.info(f"Subset: {len(subset_tracks)}")
-    else:
-        subset_tracks = source_tracks
-
     # playlists to generate
     playlist_map: Dict[str, List[Track]] = {}
+
+    # create overdue playlist
+    if config.playlists.output.overdue.enabled:
+        assert (
+            config.playlists.output.overdue.name
+        ), "No overdue playlist name provided in the config file."
+        playlist_tracks = (
+            playlist_loader.load(config.playlists.output.overdue.parent_playlist)
+            if config.playlists.output.overdue.parent_playlist is not None
+            else source_tracks
+        )
+        playlist_map[config.playlists.output.overdue.name] = sorted(
+            (x for x in playlist_tracks if x.overdue > 0),
+            key=lambda x: x.overdue,
+            reverse=True,
+        )
 
     # create the weighted shuffle playlist
     if config.playlists.output.shuffle.enabled:
         assert (
             config.playlists.output.shuffle.name
         ), "No shuffle playlist name provided in the config file."
-        Track.set_down_ranked_arists(config.playlists.output.shuffle.downranked_artists)
-        Track.set_down_ranked_genres(config.playlists.output.shuffle.downranked_genres)
+        playlist_tracks = (
+            playlist_loader.load(config.playlists.output.shuffle.parent_playlist)
+            if config.playlists.output.shuffle.parent_playlist is not None
+            else source_tracks
+        )
         playlist_map[config.playlists.output.shuffle.name] = weighted_shuffle(
-            subset_tracks
+            playlist_tracks
         )
 
     # update generated playlists
-    if active:
-        for playlist_name, tracks in playlist_map.items():
-            sentinel_path = OUTPUT_DIR / f".{playlist_name}"
-            if not sentinel_path.exists():
-                overdue = True
-            elif config.playlists.output.update_every is not None:
-                time_since_update = NOW - dt.datetime.fromtimestamp(
-                    sentinel_path.stat().st_mtime
-                )
-                hours = time_since_update / ONE_HOUR
-                logger.info(
-                    f"Time since last {playlist_name!r} update: {hours:.2f} hours"
-                )
-                overdue = time_since_update > config.playlists.output.update_every
-            else:
-                overdue = False
-            if overdue:
-                logger.warning(f"{playlist_name!r} is overdue for update")
+    for playlist_name, tracks in playlist_map.items():
+        sentinel_path = OUTPUT_DIR / f".{playlist_name}"
+        if not sentinel_path.exists():
+            overdue = True
+        elif config.playlists.output.update_every is not None:
+            time_since_update = NOW - dt.datetime.fromtimestamp(
+                sentinel_path.stat().st_mtime
+            )
+            hours = time_since_update / ONE_HOUR
+            logger.info(f"Time since last {playlist_name!r} update: {hours:.2f} hours")
+            overdue = time_since_update > config.playlists.output.update_every
+        else:
+            overdue = False
+        if overdue:
+            logger.warning(f"{playlist_name!r} is overdue for update")
+        if active:
             if config.playlists.output.force_update or overdue:
                 update_playlist(
                     music_app=music_app,
                     source_tracks=tracks,
                     playlist_name=playlist_name,
                 )
+                # TODO: update the playlist description with date
                 sentinel_path.parent.mkdir(parents=True, exist_ok=True)
                 sentinel_path.touch()
             elif config.playlists.output.remove_only:
                 # still remove unsynced tracks even if not updating the whole playlist
                 remove_unsynced_tracks(music_app, tracks, playlist_name)
+            wait_for_library_update()
+            logger.info(dt.datetime.now() - NOW)
 
     # save data
-    if config.playlists.input.save_stats:
-        save_track_data(
-            source_tracks, config.playlists.input.source_playlist, show_diff=False
-        )
-        save_total_stats(source_tracks, config.playlists.input.source_playlist)
-        if config.playlists.input.subset_playlist is not None:
-            save_track_data(
-                subset_tracks, config.playlists.input.subset_playlist, show_diff=True
+    # TODO: show diff for total stats
+    for stat_playlist in config.playlists.stats:
+        tracks = playlist_loader.load(stat_playlist.name)
+        if stat_playlist.save_totals:
+            save_total_stats(
+                tracks,
+                subdir_name=stat_playlist.name,
+                show_stats=stat_playlist.show_totals,
             )
-            save_total_stats(subset_tracks, config.playlists.input.subset_playlist)
-
-    if config.collections.save_stats:
-        save_collection_stats(source_tracks, config.playlists.input.source_playlist)
+        if stat_playlist.save_tracks:
+            save_track_data(
+                tracks,
+                subdir_name=stat_playlist.name,
+                show_diff=stat_playlist.show_track_diff,
+            )
+        if stat_playlist.save_collections:
+            save_collection_stats(tracks, subdir_name=stat_playlist.name)
+    if (
+        config.playlists.output.shuffle.enabled
+        and config.playlists.output.shuffle.save_tracks
+    ):
+        assert config.playlists.output.shuffle.name
+        save_track_data(
+            playlist_map[config.playlists.output.shuffle.name],
+            subdir_name=config.playlists.output.shuffle.name,
+            show_diff=False,
+        )
+    if (
+        config.playlists.output.overdue.enabled
+        and config.playlists.output.overdue.save_tracks
+    ):
+        assert config.playlists.output.overdue.name
+        save_track_data(
+            playlist_map[config.playlists.output.overdue.name],
+            subdir_name=config.playlists.output.overdue.name,
+            show_diff=False,
+        )
 
     logger.info(dt.datetime.now() - NOW)
 
     # wait for library update to finish
     if active and config.sync.enabled:
         assert config.sync.iphone_name, "No iPhone name provided in the config file."
-        wait_for_amplibraryagent()
-        logger.info(dt.datetime.now() - NOW)
         # then sync again
         sync_device(config.sync.iphone_name)
         logger.info(dt.datetime.now() - NOW)
