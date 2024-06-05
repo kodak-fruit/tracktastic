@@ -65,71 +65,98 @@ The `plot` and `insights` make targets expose additional python scripts, but the
 <!-- ## Configuration Options -->
 
 
-## Calculated Track Score
+## Calculated Track Metrics
 
-This section explains the calculation process for determining the score of a music track based on various metrics such as play count, skip count, and time-based factors.
-
-### Key Metrics
+This section explains various metrics that are calculated for each track.
 
 1. **Play Rate**: The average number of plays per unit time since the track was added.
    ```
    play_rate = play_count / duration_since_added
    ```
 
-2. **Skip Rate**: The average number of skips per unit time since the track was added.
+   The Play Rate is useful for finding favorite tracks because it doesn't suffer the same limitations of Play Count, which favors older tracks. The Play Rate will be elevated for both newer and older tracks in the library that are consistently listened to.
+
+   It can conceptually be thought of as, e.g. "This song is played 5 times per year".
+
+   The Play Rate will also naturally decay over time for tracks that are no longer listened to.
+
+   However this metric tends to overweight shorter songs which may naturally have a higher play count than average.
+
+2. **Listen Rate**: The total time spent listening to the track per unit time since it was added.
+   ```
+   time_spent_listening = play_count * track_duration
+   listen_rate = time_spent_listening / duration_since_added
+   ```
+
+   Similar to the Play Rate, the Listen Rate can be conceptually interpretted as, e.g. "This song is played for 30 minutes per year".
+
+   This metric provides a counterweight against the Play Rate, as it tends to overweight longer songs instead.
+
+3. **Skip Rate**: The average number of skips per unit time since the track was added.
    ```
    skip_rate = skip_count / duration_since_added
    ```
 
-3. **Listen Rate**: The total time spent listening to the track per unit time since it was added, normalized by the median song length.
-   ```
-   time_spent_listening = play_count * track_duration
-   listen_rate = time_spent_listening / duration_since_added
-   norm_listen_rate = listen_rate / median_song_length
-   ```
-
 4. **Net Rate**: A composite metric that combines play rate, normalized listen rate, and skip rate.
    ```
+   norm_listen_rate = listen_rate / median_song_length
    net_rate = (play_rate + norm_listen_rate - skip_rate) / 2
    ```
 
-## Time Between Plays and Overdue Duration
+   Averaging the Play Rate and Listen Rate provides a decent compromise between the tendency of each to overweight shorter/longer songs. To make their units compatible, the Listen Rate is normalized by the median song length.
 
-5. **Time Between Plays**: A representative value for the average duration between plays based on the net rate.
+   The median song length is calculated from the statistics generated from prior runs. If unavailable, a default value of approximately 3:45 is used.
+
+   The Skip Rate also provides a signal that accelerates the decay of the Net Rate, although at a decreased effect compared to a playing.
+
+5. **Score**: The score is a logarithmically scaled value of the Net Rate.
+   ```
+   score = log_n(1 + net_rate)
+   ```
+   Where:
+   - `n` is used to adjust the scaling of the score.
+
+   The scaling value `n` is determined by finding the value that forces the median score to equal 2.5. This helps create a (still non-linear) range of values that are comparable to the (linear) 0-5 scale used for star ratings.
+
+   The Score is useful because it has a narrower range of values than the Net Rate and can be easier to interpret in user-facing applications. Because the use of the logarithm renders this value unitless, it is simply referred to as the "score".
+
+6. **Track Rating**: The track rating is from the Music app and updated by this script based on the Score.
+
+   Because the rating is fixed point and doesn't accept arbitrary fractional values, the rating is set by creating 100 equal-sized bins, populating them by traversing the tracks ordered by score, and setting the rating to the next available increment.
+
+   This creates a truly linearized value from 0.05 to 5.00 based on the ordering.
+
+7. **Time Between Plays**: A representative value for the average duration between plays based on the net rate.
    ```
    time_between_plays = 1 / net_rate
    ```
 
-6. **Overdue Duration**: The difference between the duration since the last interaction (either play or skip) and the expected duration between plays.
+   The Time Between Plays provides an alternative interpretation of the Net Rate and is more well-behaved for highly played songs.
+
+8. **Overdue Duration**: The difference between the duration since the last interaction (either play or skip) and the expected duration between plays.
    ```
    duration_since_last_interaction = min(duration_since_last_played, duration_since_last_skipped)
    overdue_duration = duration_since_last_interaction - time_between_plays
    ```
 
-7. **Overdue Factor**: The normalized ratio of the overdue duration to the expected duration between plays.
+   The Overdue Duration represents how much time has passed since the track was expected to be interacted with again.
+
+   Positive durations represent how overdue the user is in playing or skipping this track pas the Time Between Plays. Negative durations represent times in the future (e.g. -5 days means the track is expected to be played in 5 days.).
+
+9. **Overdue Factor**: The normalized ratio of the overdue duration to the expected duration between plays.
    ```
    overdue = overdue_duration / time_between_plays
    ```
 
-The overdue factor measures how overdue a track is for being played again. Positive values indicates that a track has not been played for a longer time than expected based on its play rate. This metric has a minimum value of -1.
+   The normalized overdue factor is useful when comparing relative values for different tracks, as the overdue duration may otherwise span a large range.
 
-### Score Calculation
+   This metric has a minimum value of -1 (for just played/skipped), a 0 value indicating , and an unbounded upper bound as the track becomes more overdue.
 
-The final score is a logarithmic function of the net rate.
-```
-score = log_n(1 + net_rate)
-```
+   Note: This value has some interesting dynamics in how it evolves over time, considering that durations affect both the numerator and denominator. However, for songs with a positive Net Rate, the overdue factor is always expected to become positive given enough time.
 
-Where:
-- `n` is used to adjust the scaling of the score.
+## Smart Shuffle Algorithm
 
-The score provides a relative measure of how often the track is played, taking into account how often it is played versus skipped, and adjusting for the time since it was added to the library.
-
-The scaling value `n` is determined by finding that value forces the median score to equal 2.5. This helps create a (non-linear) range of values that are comparable to the (linear) 0-5 scale used for star ratings.
-
-## Weighted Shuffle Algorithm
-
-This section describes the weighted shuffle algorithm used for ordering a list of music tracks based on their individual scores and other influencing factors. The algorithm ensures that tracks with higher scores or positive attributes have a higher probability of appearing earlier in the shuffled list.
+This section describes the weighted shuffle algorithm used for ordering a list of tracks based on their metrics.
 
 ### Algorithm Description
 
@@ -151,9 +178,9 @@ This section describes the weighted shuffle algorithm used for ordering a list o
 
 ### Summary
 
-The weighted shuffle algorithm provides a method for ordering tracks based on a combination of their scores, downranking, favorite status, and overdue factors. By adjusting the weights accordingly, the algorithm ensures a fair and dynamic shuffle that reflects the varying attributes of each track.
+The smart shuffle provides a fair balance between how liked a track is and whether it is overdue to be played again. Even in cases where a selected track is skipped, this provides an aditional signal to update the score and overdue factor to help refine future selections.
 
-## Similarity Score Behavior
+## Similarity Score Behavior (WIP)
 
 The similarity score is a measure that quantifies how similar two tracks are based on various attributes. The score ranges from 0 to 1, with 0 indicating no similarity and 1 indicating identical attributes. Here’s how the similarity score is determined:
 
