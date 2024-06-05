@@ -76,7 +76,7 @@ This section explains various metrics that are calculated for each track.
 
    The Play Rate is useful for finding favorite tracks because it doesn't suffer the same limitations of Play Count, which favors older tracks. The Play Rate will be elevated for both newer and older tracks in the library that are consistently listened to.
 
-   It can conceptually be thought of as, e.g. "This song is played 5 times per year".
+   It can conceptually be thought of as, e.g. "This song is played 5 times per year on average".
 
    The Play Rate will also naturally decay over time for tracks that are no longer listened to.
 
@@ -88,7 +88,7 @@ This section explains various metrics that are calculated for each track.
    listen_rate = time_spent_listening / duration_since_added
    ```
 
-   Similar to the Play Rate, the Listen Rate can be conceptually interpretted as, e.g. "This song is played for 30 minutes per year".
+   Similar to the Play Rate, the Listen Rate can be conceptually interpreted as, e.g. "This song is played for 30 minutes per year on average".
 
    This metric provides a counterweight against the Play Rate, as it tends to overweight longer songs instead.
 
@@ -107,7 +107,7 @@ This section explains various metrics that are calculated for each track.
 
    The median song length is calculated from the statistics generated from prior runs. If unavailable, a default value of approximately 3:45 is used.
 
-   The Skip Rate also provides a signal that accelerates the decay of the Net Rate, although at a decreased effect compared to a playing.
+   The Skip Rate also provides a signal that accelerates the decay of the Net Rate, although at a decreased effect compared to playing.
 
 5. **Score**: The score is a logarithmically scaled value of the Net Rate.
    ```
@@ -131,7 +131,7 @@ This section explains various metrics that are calculated for each track.
    time_between_plays = 1 / net_rate
    ```
 
-   The Time Between Plays provides an alternative interpretation of the Net Rate and is more well-behaved for highly played songs.
+   The Time Between Plays provides an alternative interpretation of the Net Rate and is more well-behaved for recently added songs.
 
 8. **Overdue Duration**: The difference between the duration since the last interaction (either play or skip) and the expected duration between plays.
    ```
@@ -150,7 +150,7 @@ This section explains various metrics that are calculated for each track.
 
    The normalized overdue factor is useful when comparing relative values for different tracks, as the overdue duration may otherwise span a large range.
 
-   This metric has a minimum value of -1 (for just played/skipped), a 0 value indicating , and an unbounded upper bound as the track becomes more overdue.
+   This metric has a minimum value of -1 (for just played/skipped), a 0 value indicating the track is right on schedule to be played again, and an unbounded upper value as the track becomes more overdue.
 
    Note: This value has some interesting dynamics in how it evolves over time, considering that durations affect both the numerator and denominator. However, for songs with a positive Net Rate, the overdue factor is always expected to become positive given enough time.
 
