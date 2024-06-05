@@ -15,6 +15,7 @@ from music import (
     Config,
     PlaylistLoader,
     Track,
+    filter_percent,
     init_logger,
     remove_unsynced_tracks,
     save_collection_stats,
@@ -98,11 +99,18 @@ def cli(
         logger.info(dt.datetime.now() - NOW)
 
     # set favorites
-    if active and config.favorites.update:
+    if config.favorites.update:
         assert (
             config.favorites.top_percent
         ), "No top percent provided in the config file."
-        update_favorites(source_tracks, config.favorites.top_percent)
+        update_favorites(
+            source_tracks,
+            fav_percent=config.favorites.top_percent,
+            active=active and config.favorites.update,
+        )
+        if active:
+            wait_for_library_update()
+            logger.info(dt.datetime.now() - NOW)
 
     # playlists to generate
     playlist_map: Dict[str, List[Track]] = {}
@@ -123,6 +131,9 @@ def cli(
             reverse=True,
         )
 
+    # TODO: really the source tracks needs to be reloaded
+    # between each playlist getting updated
+
     # create the weighted shuffle playlist
     if config.playlists.output.shuffle.enabled:
         assert (
@@ -133,9 +144,10 @@ def cli(
             if config.playlists.output.shuffle.parent_playlist is not None
             else source_tracks
         )
-        playlist_map[config.playlists.output.shuffle.name] = weighted_shuffle(
-            playlist_tracks
-        )
+        playlist_tracks = weighted_shuffle(playlist_tracks)
+        # TODO: just move this into the weighted_shuffle function
+        playlist_tracks = filter_percent(playlist_tracks, 50)
+        playlist_map[config.playlists.output.shuffle.name] = playlist_tracks
 
     # update generated playlists
     for playlist_name, tracks in playlist_map.items():

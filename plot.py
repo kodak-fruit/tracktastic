@@ -66,9 +66,11 @@ def cli() -> None:
     #         artists.append(track_artist)
     # artists.sort(key=lambda x: x["score"]["avg"], reverse=True)
 
+    default_tracks = candidates
+
     plot_score_over_rating(candidates, synced)
     plot_highlighted_scores(
-        synced,
+        default_tracks,
         title="ill/IAN",
         cond=lambda x: (
             x["track_artist"].casefold() in (artists := ("ian sweet", "ill peach"))
@@ -76,7 +78,7 @@ def cli() -> None:
         ),
         max_notes=3,
     )
-    plot_rates(candidates)
+    plot_rates(default_tracks)
     plot_shuffle(shuffled)
     plot_highlighted_scores(
         shuffled,
@@ -105,74 +107,73 @@ def cli() -> None:
     plot_score_vs_track_number(track_numbers)
     plot_score_vs_date_since_added(candidates)
     plot_track_number_counts(track_numbers)
-    # plot_score_vs_overdue(candidates)
-    plot_score_vs_overdue(synced)
-    plot_days_since_last_interaction_vs_overdue(synced)
+    plot_score_vs_overdue(default_tracks)
+    plot_days_since_last_interaction_vs_overdue(default_tracks)
     plot_and_hist(
-        synced,
+        default_tracks,
         title="size",
         key=lambda x: x["size"] / 1024 / 1024,
         y_label="size (MB)",
         bins=100,
     )
     plot_and_hist(
-        synced,
+        default_tracks,
         title="score",
         key=lambda x: x["score"],
         y_label="score",
         bins=500,
     )
     plot_and_hist(
-        synced,
+        default_tracks,
         title="duration",
         key=lambda x: x["duration"],
-        y_label="duration",
+        y_label="duration (min)",
         bins=100,
     )
     plot_and_hist(
-        synced,
+        default_tracks,
         title="bit rate",
         key=lambda x: (x["size"] * 8 / 1024) / (x["duration"] * 60),
         y_label="bit rate (kbps)",
         bins=100,
     )
     plot_and_hist(
-        synced,
+        default_tracks,
         title="overdue",
         key=lambda x: x["overdue"],
         y_label="overdue",
         bins=100,
     )
     plot_and_hist(
-        synced,
+        default_tracks,
         title="average time between plays/skips",
         key=lambda x: x["days_between_plays"],
         y_label="days",
         bins=100,
     )
     plot_and_hist(
-        synced,
+        default_tracks,
         title="days since last interaction",
         key=lambda x: x["days_since_last_interaction"],
         y_label="days since last interaction",
         bins=100,
     )
     plot_and_hist(
-        synced,
+        default_tracks,
         title="years since added",
         key=lambda x: x["years_since_added"],
         y_label="years since added",
         bins=100,
     )
     plot_and_hist(
-        synced,
+        default_tracks,
         title="days overdue",
         key=lambda x: x["days_overdue"],
         y_label="days overdue",
         bins=100,
     )
     plot_and_hist(
-        synced,
+        default_tracks,
         title="last played",
         key=lambda x: x["days_since_last_played"],
         y_label="days",
@@ -247,10 +248,9 @@ def plot_rates(tracks: List[Dict[str, Any]]) -> None:
 
 
 def plot_shuffle(shuffled: List[Dict[str, Any]]) -> None:
-    y_field = "score"
-    y = [record[y_field] for record in shuffled]
+    y_key: Callable[[Dict[str, Any]], float] = lambda x: x["score"] * (1 + x["overdue"])
+    y = [y_key(record) for record in shuffled]
 
-    x_field = "index"
     x = range(len(y))
 
     _fig, ax = plt.subplots()
@@ -258,8 +258,8 @@ def plot_shuffle(shuffled: List[Dict[str, Any]]) -> None:
 
     ax.scatter(x, y)
     ax.set_title("shuffle score distribution")
-    ax.set_xlabel(x_field)
-    ax.set_ylabel(y_field)
+    ax.set_xlabel("index")
+    ax.set_ylabel("score * (1 + overdue)")
 
 
 def plot_highlighted_scores(
@@ -272,9 +272,9 @@ def plot_highlighted_scores(
     low = [record for record in tracks if not cond(record)]
     high = [record for record in tracks if cond(record)]
 
-    y_field = "score"
-    y1 = [record[y_field] for record in low]
-    y2 = [record[y_field] for record in high]
+    y_key: Callable[[Dict[str, Any]], float] = lambda x: x["score"]
+    y1 = [y_key(record) for record in low]
+    y2 = [y_key(record) for record in high]
 
     x_field = "index"
     x1 = [record[x_field] for record in low]
@@ -291,17 +291,17 @@ def plot_highlighted_scores(
 
     # annotate max_notes lowest/highest values on both x and y axes
     annotated = []
-    annotated.extend(sorted(high, key=lambda x: x[y_field])[:max_notes])
-    annotated.extend(sorted(high, key=lambda x: x[y_field], reverse=True)[:max_notes])
-    annotated.extend(sorted(high, key=lambda x: x[x_field])[:max_notes])
-    annotated.extend(sorted(high, key=lambda x: x[x_field], reverse=True)[:max_notes])
+    annotated.extend(sorted(high, key=y_key)[:max_notes])
+    annotated.extend(sorted(high, key=y_key, reverse=True)[:max_notes])
+    annotated.extend(sorted(high, key=y_key)[:max_notes])
+    annotated.extend(sorted(high, key=y_key, reverse=True)[:max_notes])
     annotated = list({record["dbid"]: record for record in annotated}.values())
     for record in annotated:
         note = f"{record['name']} - {record['track_artist']}"
         safe_note = note.replace("$", r"\$")
         ax.annotate(
             safe_note,
-            (record[x_field], record[y_field]),
+            (record[x_field], y_key(record)),
             textcoords="offset points",
             xytext=(0, 10),
             ha="center",

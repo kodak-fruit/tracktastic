@@ -65,7 +65,7 @@ The `plot` and `insights` make targets expose additional python scripts, but the
 <!-- ## Configuration Options -->
 
 
-## Score Calculation for Music Tracks
+## Calculated Track Score
 
 This section explains the calculation process for determining the score of a music track based on various metrics such as play count, skip count, and time-based factors.
 
@@ -102,6 +102,7 @@ This section explains the calculation process for determining the score of a mus
 
 6. **Overdue Duration**: The difference between the duration since the last interaction (either play or skip) and the expected duration between plays.
    ```
+   duration_since_last_interaction = min(duration_since_last_played, duration_since_last_skipped)
    overdue_duration = duration_since_last_interaction - time_between_plays
    ```
 
@@ -110,9 +111,7 @@ This section explains the calculation process for determining the score of a mus
    overdue = overdue_duration / time_between_plays
    ```
 
-#### Explanation of Overdue Factor
-
-The overdue factor measures how overdue a track is for being played again. A higher overdue factor indicates that a track has not been played for a longer time than expected based on its play rate. This metric helps in identifying tracks that might need attention or re-evaluation, especially in creating playlists or deciding which tracks to promote or demote.
+The overdue factor measures how overdue a track is for being played again. Positive values indicates that a track has not been played for a longer time than expected based on its play rate. This metric has a minimum value of -1.
 
 ### Score Calculation
 
@@ -122,9 +121,11 @@ score = log_n(1 + net_rate)
 ```
 
 Where:
-- `n` is a predefined constant used to adjust the scaling of the score.
+- `n` is used to adjust the scaling of the score.
 
-The score provides a quantitative measure of the track's popularity and engagement, taking into account how often it is played versus skipped, and adjusting for the time since it was added to the library.
+The score provides a relative measure of how often the track is played, taking into account how often it is played versus skipped, and adjusting for the time since it was added to the library.
+
+The scaling value `n` is determined by finding that value forces the median score to equal 2.5. This helps create a (non-linear) range of values that are comparable to the (linear) 0-5 scale used for star ratings.
 
 ## Weighted Shuffle Algorithm
 
@@ -132,20 +133,15 @@ This section describes the weighted shuffle algorithm used for ordering a list o
 
 ### Algorithm Description
 
-1. **Initialize Random Seed**:
-   - A random seed is set based on the current day to ensure that the shuffle result remains consistent throughout the day.
+1. **Prepare Weights**:
+   - For each track, an initial weight is set to the track's score.
+   - The weight is normalized by subtracting the minimum score of all the tracks and adding a small floor (0.01), to prevent negative and zero weights.
+   - The weight is multiplied by `(1 + overdue)`.
+   - If the track artist or genre is downranked, the weight is halved.
+   - If the track is marked as a favorite, the weight is doubled.
 
-2. **Prepare Weights**:
-   - For each track, an initial weight is calculated based on the track's score. If a track has a score of zero, a predefined target median score is used instead.
-   - The weight is then adjusted:
-     - If the track is downranked, the weight is halved.
-     - If the track is marked as a favorite, the weight is doubled.
-   - Further adjustments are made based on the track's overdue factor, which measures how overdue the track is for being played. The weight is multiplied by `(1 + overdue factor)`.
 
-3. **Normalize Weights**:
-   - To avoid negative or zero weights, the smallest weight is identified, and a small floor value (e.g., 0.01) is added to each weight after subtracting the minimum weight from each.
-
-4. **Shuffle Process**:
+2. **Shuffle Process**:
    - The total weight of all tracks is calculated.
    - A loop runs until all tracks have been shuffled:
      - A random value between 0 and the total weight is generated.
@@ -156,6 +152,38 @@ This section describes the weighted shuffle algorithm used for ordering a list o
 ### Summary
 
 The weighted shuffle algorithm provides a method for ordering tracks based on a combination of their scores, downranking, favorite status, and overdue factors. By adjusting the weights accordingly, the algorithm ensures a fair and dynamic shuffle that reflects the varying attributes of each track.
+
+## Similarity Score Behavior
+
+The similarity score is a measure that quantifies how similar two tracks are based on various attributes. The score ranges from 0 to 1, with 0 indicating no similarity and 1 indicating identical attributes. Here’s how the similarity score is determined:
+
+1. **Album and Album Artist**:
+   - If both tracks belong to the same album and have the same album artist, they are considered more similar.
+
+2. **Genre**:
+   - Tracks sharing the same genre are considered more similar.
+
+3. **Year of Release**:
+   - Track similarity scales with similar release years if they are within five years.
+
+4. **Date Added**:
+   - Tracks added to the library within six months of each other are considered more similar.
+
+5. **Last Played Date**:
+   - If both tracks were last played on the same day, they are considered more similar.
+
+6. **Playlists**:
+   - The more playlists the two tracks share, the higher their similarity.
+
+7. **Compilation Status**:
+   - If both tracks are part of a compilation, they are considered more similar.
+
+8. **Duration**:
+   - Track similar scales with similar durations if they are within one median song length.
+
+<!-- TODO: discuss the other fields -->
+
+The similarity score aggregates these individual factors, normalizing them to ensure the final score is between 0 and 1. This score helps in identifying tracks that have multiple shared attributes, which can be useful for creating cohesive playlists or recommendations.
 
 ## License
 

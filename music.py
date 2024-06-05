@@ -30,6 +30,7 @@ CONFIG_PATH = SCRIPT_DIR / "config.toml"
 LOG_PATH = OUTPUT_DIR / "log.txt"
 
 # TODO: just use a sql database for stats w/ history, instead of json file snapshots
+# TODO: last.fm playlists
 
 NOW = dt.datetime.now()
 ONE_YEAR = dt.timedelta(days=365.25)
@@ -38,8 +39,8 @@ ONE_DAY = dt.timedelta(days=1)
 ONE_HOUR = dt.timedelta(hours=1)
 ONE_MIN = dt.timedelta(minutes=1)
 
-MEDIAN_SONG_LENGTH = dt.timedelta(minutes=3, seconds=48.208496)
-DEFAULT_SCORE_BASE = 1.587
+MEDIAN_SONG_LENGTH = dt.timedelta(minutes=3, seconds=48.1)
+DEFAULT_SCORE_BASE = 1.591
 TARGET_MEDIAN_SCORE = (5.0 + 0.05) / 2
 
 PROGRESS_INTERVAL = 2.5
@@ -73,6 +74,7 @@ class Track:
     compilation: bool
     size: int
     favorite: bool
+    disliked: bool
     last_played: dt.datetime
     last_skipped: dt.datetime
 
@@ -133,7 +135,6 @@ class Track:
         sim_vec.append(playlist_sim)
         # is compilation
         sim_vec.append(self.compilation == other.compilation)
-        # TODO: has artwork
         # duration
         duration_diff = abs(self.duration - other.duration)
         duration_sim = (
@@ -142,6 +143,26 @@ class Track:
             else 0
         )
         sim_vec.append(duration_sim)
+        # similar score
+        score_diff = abs(self.score - other.score)
+        score_sim = (
+            1 - score_diff / TARGET_MEDIAN_SCORE
+            if score_diff < TARGET_MEDIAN_SCORE
+            else 0
+        )
+        sim_vec.append(score_sim)
+        # similar overdue
+        overdue_diff = abs(self.overdue - other.overdue)
+        overdue_sim = 1 - overdue_diff if overdue_diff <= 1 else 0
+        sim_vec.append(overdue_sim)
+        # upper / lowe case title
+        sim_vec.append(
+            self.name.islower() == other.name.islower()
+            and self.name.isupper() == other.name.isupper()
+        )
+        # track number
+        sim_vec.append(self.track_number == other.track_number)
+        # TODO: has artwork
 
         # return sum(sim_vec) / len(sim_vec)
 
@@ -180,6 +201,7 @@ class Track:
         compilation = api.compilation()
         size = api.size()
         favorite = api.favorited()
+        disliked = api.disliked()
         last_played = api.played_date()
         last_skipped = api.skipped_date()
 
@@ -239,6 +261,7 @@ class Track:
             compilation=compilation,
             size=size,
             favorite=favorite,
+            disliked=disliked,
             last_played=last_played,
             last_skipped=last_skipped,
             duration_since_last_played=duration_since_last_played,
@@ -294,6 +317,7 @@ class Track:
             compilation=data["compilation"],
             size=data["size"],
             favorite=data["favorite"],
+            disliked=data["disliked"],
             last_played=NOW - data["days_since_last_played"] * ONE_DAY,
             last_skipped=NOW - data["days_since_last_skipped"] * ONE_DAY,
             playlists=data["playlists"],
@@ -330,6 +354,7 @@ class Track:
             "playlists": sorted(self.playlists),
             "compilation": self.compilation,
             "favorite": self.favorite,
+            "disliked": self.disliked,
             "size": self.size,
             "dbid": self.dbid,
         }
@@ -352,25 +377,31 @@ class Track:
         if active:
             self.api.rating.set(rating)
 
-    def set_favorite_status(self, status: FavoriteStatus) -> None:
+    def set_favorite_status(self, status: FavoriteStatus, *, active: bool) -> None:
         assert self.api is not None
         if status == FavoriteStatus.FAVORITED:
-            if self.api.favorited.get() is False:
+            if self.favorite is False:
                 logger.info(f"💗 {self.display()}")
-                self.api.favorited.set(True)
                 self.favorite = True
+                if active:
+                    self.api.favorited.set(True)
         elif status == FavoriteStatus.DISLIKED:
-            if self.api.disliked.get() is False:
+            if self.disliked is False:
                 logger.info(f"😾 {self.display()}")
-                self.api.disliked.set(True)
+                self.disliked = True
+                if active:
+                    self.api.disliked.set(True)
         elif status == FavoriteStatus.NONE:
-            if self.api.favorited.get() is True:
+            if self.favorite is True:
                 logger.info(f"💔 {self.display()}")
-                self.api.favorited.set(False)
                 self.favorite = False
-            if self.api.disliked.get() is True:
+                if active:
+                    self.api.favorited.set(False)
+            if self.disliked is True:
                 logger.info(f"🫤 {self.display()}")
-                self.api.disliked.set(False)
+                self.disliked = False
+                if active:
+                    self.api.disliked.set(False)
         else:
             raise ValueError(f"Invalid favorite status: {status}")
 
@@ -827,7 +858,7 @@ def update_track_ratings(tracks: List[Track], *, active: bool) -> None:
         track.set_rating(rating, active=active)
 
 
-def update_favorites(tracks: List[Track], fav_percent: float) -> None:
+def update_favorites(tracks: List[Track], *, fav_percent: float, active: bool) -> None:
     logger.info("Updating favorites")
     fav_limit = round(len(tracks) * (fav_percent / 100))
     # assumes sorted
@@ -836,7 +867,7 @@ def update_favorites(tracks: List[Track], fav_percent: float) -> None:
             favorited = FavoriteStatus.FAVORITED
         else:
             favorited = FavoriteStatus.NONE
-        track.set_favorite_status(favorited)
+        track.set_favorite_status(favorited, active=active)
 
 
 def weighted_shuffle(tracks: List[Track]) -> List[Track]:
@@ -848,30 +879,19 @@ def weighted_shuffle(tracks: List[Track]) -> List[Track]:
 
     shuffled = []
     tracks = tracks.copy()
-    # tracks.sort(key=lambda x: x.score, reverse=True)
+    min_score = min(track.score for track in tracks)
+    weight_floor = 0.01
     weights = []
-    # median_net_rate = Track.score_base ** TARGET_MEDIAN_SCORE - 1
     for track in tracks:
-        # if track.net_rate != 0:
-        #     weight = track.net_rate
-        # else:
-        #     weight = median_net_rate
-        if track.score != 0:
-            weight = track.score
-        else:
-            weight = TARGET_MEDIAN_SCORE
+        # raise weights to a minimum floor (to avoid negative and zero weights)
+        weight = track.score - min_score + weight_floor
+        weight *= 1 + track.overdue
         if track.is_downranked():
             weight /= 2
         elif track.favorite:
             weight *= 2
-        # adjust weight by overdue percentage
-        weight *= 1 + track.overdue
         weights.append(weight)
     tic = time.perf_counter()
-    # raise weights to a minimum floor (to avoid negative and zero weights)
-    min_weight = min(weights)
-    weight_floor = 0.01
-    weights = [weight - min_weight + weight_floor for weight in weights]
     # sims = [0.0] * len(tracks)
     total_weight = sum(weights)
     while tracks:
@@ -1331,3 +1351,27 @@ def human_readable_size(size: float) -> str:
         return f"{size:.1f} MB"
     size /= base
     return f"{size:.1f} GB"
+
+
+def filter_percent(tracks: List[Track], percent: float) -> List[Track]:
+    return tracks[: int(len(tracks) * percent / 100)]
+
+
+def filter_duration(tracks: List[Track], duration: dt.timedelta) -> List[Track]:
+    length = dt.timedelta()
+    filtered = []
+    for track in tracks:
+        if length + track.duration <= duration:
+            filtered.append(track)
+            length += track.duration
+    return filtered
+
+
+def filter_unique_track_numbers(tracks: List[Track]) -> List[Track]:
+    track_numbers = set()
+    filtered = []
+    for track in tracks:
+        if track.track_number not in track_numbers:
+            filtered.append(track)
+            track_numbers.add(track.track_number)
+    return filtered

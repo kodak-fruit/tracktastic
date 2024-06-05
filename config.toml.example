@@ -81,5 +81,5 @@ downranked_artists = [
 [playlists.output.overdue]
 enabled = true
 name = "overdue"
-parent_playlist = "strict candidates"
+parent_playlist = "candidates"
 save_tracks = true
